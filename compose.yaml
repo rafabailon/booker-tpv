@@ -1,0 +1,205 @@
+name: booker-tpv
+
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-booker_tpv}
+      POSTGRES_USER: ${POSTGRES_USER:-booker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - backend
+
+  api:
+    build:
+      context: ./backend
+      target: runtime
+    environment: &api-environment
+      DATABASE_HOST: db
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ${POSTGRES_DB:-booker_tpv}
+      DATABASE_USER: ${POSTGRES_USER:-booker}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?Define POSTGRES_PASSWORD en .env}
+      APP_SECRET: ${APP_SECRET:?Define APP_SECRET en .env}
+      APP_ENV: ${APP_ENV:-production}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Europe/Madrid}
+      APP_CURRENCY: ${APP_CURRENCY:-EUR}
+      PRICES_INCLUDE_TAX: ${PRICES_INCLUDE_TAX:-true}
+      LOW_STOCK_THRESHOLD: ${LOW_STOCK_THRESHOLD:-3}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-http://localhost:8080}
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live')"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - backend
+
+  init:
+    build:
+      context: ./backend
+      target: runtime
+    command: ["sh", "-c", "alembic upgrade head && python -m app.bootstrap_admin"]
+    environment: *api-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - backend
+
+  web:
+    build:
+      context: ./frontend
+      target: production
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - backend
+
+  migrate:
+    build:
+      context: ./backend
+      target: runtime
+    profiles: [tools]
+    command: ["alembic", "upgrade", "head"]
+    environment: *api-environment
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+
+  frontend-lock:
+    image: node:24-alpine
+    profiles: [tools]
+    working_dir: /app
+    user: ${HOST_UID:-1000}:${HOST_GID:-1000}
+    volumes:
+      - ./frontend:/app
+    command: ["npm", "install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]
+
+  api-dev:
+    build:
+      context: ./backend
+      target: runtime
+    profiles: [dev]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      <<: *api-environment
+      APP_ENV: development
+      COOKIE_SECURE: "false"
+      ALLOWED_ORIGIN: http://localhost:5173
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
+
+  web-dev:
+    build:
+      context: ./frontend
+      target: development
+    profiles: [dev]
+    command: ["sh", "./dev-entrypoint.sh"]
+    environment:
+      VITE_API_PROXY_TARGET: http://api-dev:8000
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api-dev
+    networks:
+      - backend
+
+  test-db:
+    image: postgres:18-alpine
+    profiles: [test]
+    environment:
+      POSTGRES_DB: booker_tpv_test
+      POSTGRES_USER: booker
+      POSTGRES_PASSWORD: test-only-password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks:
+      - backend
+
+  backend-tests:
+    build:
+      context: ./backend
+      target: test
+    profiles: [test]
+    command: ["python", "-m", "pytest", "-q"]
+    environment:
+      DATABASE_HOST: test-db
+      DATABASE_PORT: 5432
+      DATABASE_NAME: booker_tpv_test
+      DATABASE_USER: booker
+      DATABASE_PASSWORD: test-only-password
+      APP_SECRET: test-secret-that-is-long-enough-for-tests
+      APP_ENV: test
+      COOKIE_SECURE: "false"
+      BOOTSTRAP_ADMIN_USERNAME: admin
+      BOOTSTRAP_ADMIN_PASSWORD: test-admin-password
+    depends_on:
+      test-db:
+        condition: service_healthy
+    networks:
+      - backend
+
+  frontend-tests:
+    build:
+      context: ./frontend
+      target: development
+    profiles: [test]
+    command: ["npm", "run", "test", "--", "--run"]
+    networks:
+      - backend
+
+volumes:
+  pgdata:
+  frontend_node_modules:
+
+networks:
+  backend:
+    driver: bridge
